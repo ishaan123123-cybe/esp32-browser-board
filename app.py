@@ -1,13 +1,14 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context
 from playwright.sync_api import sync_playwright
 import io
 import threading
 import os
+import time
 
 app = Flask(__name__)
 
-WIDTH = 240
-HEIGHT = 320
+WIDTH = 320
+HEIGHT = 240
 
 browser_lock = threading.Lock()
 
@@ -65,21 +66,8 @@ def home():
     </head>
     <body style="background:#111; color:white; font-family:Arial; text-align:center; padding:40px;">
         <h1>ESP32 Browser</h1>
-        <p>Browser server is running</p>
-        <p>
-            <a href="/screen" style="color:#4da6ff">
-                View browser screenshot
-            </a>
-        </p>
+        <p>Browser server is running with Keep-Alive stream</p>
         <p id="url">Loading...</p>
-        <script>
-            fetch("/status")
-                .then(r => r.json())
-                .then(d => {
-                    document.getElementById("url").innerText =
-                        "Current URL: " + d.url;
-                });
-        </script>
     </body>
     </html>"""
 
@@ -106,13 +94,14 @@ def screen():
         with browser_lock:
             image = browser_page.screenshot(
                 type="jpeg",
-                quality=60,
+                quality=35,
                 full_page=False
             )
         return send_file(
             io.BytesIO(image),
             mimetype="image/jpeg",
-            download_name="screen.jpg"
+            download_name="screen.jpg",
+            max_age=0
         )
     except Exception as e:
         return jsonify({
@@ -120,21 +109,46 @@ def screen():
             "error": str(e)
         }), 500
 
+@app.get("/stream-stream")
+@app.get("/stream")
+def stream_screen():
+    @stream_with_context
+    def generate():
+        while True:
+            try:
+                browser_page = get_browser()
+                with browser_lock:
+                    image = browser_page.screenshot(
+                        type="jpeg",
+                        quality=35,
+                        full_page=False
+                    )
+                
+                # Send multipart frame boundary chunk pattern for continuous connection
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n" +
+                       f"Content-Length: {len(image)}\r\n\r\n".encode() +
+                       image + b"\r\n")
+            except Exception as e:
+                print(f"Stream error: {e}")
+                break
+            time.sleep(0.05)
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Connection": "keep-alive", "X-Accel-Buffering": "no"}
+    )
+
 @app.post("/navigate")
 def navigate():
     data = request.get_json(silent=True)
     if not data or "url" not in data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing url"
-        }), 400
+        return jsonify({"ok": False, "error": "Missing url"}), 400
 
     url = str(data["url"]).strip()
     if not url:
-        return jsonify({
-            "ok": False,
-            "error": "Empty URL"
-        }), 400
+        return jsonify({"ok": False, "error": "Empty URL"}), 400
 
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
@@ -142,213 +156,107 @@ def navigate():
     try:
         browser_page = get_browser()
         with browser_lock:
-            browser_page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-        return jsonify({
-            "ok": True,
-            "url": browser_page.url
-        })
+            browser_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/touch")
 def touch():
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing JSON"
-        }), 400
-
-    if "x" not in data or "y" not in data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing x or y"
-        }), 400
+    if not data or "x" not in data or "y" not in data:
+        return jsonify({"ok": False, "error": "Missing x or y"}), 400
 
     try:
-        x = float(data["x"])
-        y = float(data["y"])
+        x = max(0, min(WIDTH - 1, float(data["x"])))
+        y = max(0, min(HEIGHT - 1, float(data["y"])))
     except Exception:
-        return jsonify({
-            "ok": False,
-            "error": "x and y must be numbers"
-        }), 400
-
-    x = max(0, min(WIDTH - 1, x))
-    y = max(0, min(HEIGHT - 1, y))
+        return jsonify({"ok": False, "error": "Invalid x or y coordinates"}), 400
 
     try:
         browser_page = get_browser()
         with browser_lock:
             browser_page.mouse.click(x, y)
-        return jsonify({
-            "ok": True,
-            "x": x,
-            "y": y
-        })
+        return jsonify({"ok": True, "x": x, "y": y})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/scroll")
 def scroll():
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing JSON"
-        }), 400
-
     try:
-        amount = float(data.get("amount", 300))
+        amount = float(data.get("amount", 300)) if data else 300
     except Exception:
-        return jsonify({
-            "ok": False,
-            "error": "Invalid amount"
-        }), 400
+        return jsonify({"ok": False, "error": "Invalid amount"}), 400
 
     try:
         browser_page = get_browser()
         with browser_lock:
             browser_page.mouse.wheel(0, amount)
-        return jsonify({
-            "ok": True,
-            "amount": amount
-        })
+        return jsonify({"ok": True, "amount": amount})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/back")
 def back():
     try:
         browser_page = get_browser()
         with browser_lock:
-            browser_page.go_back(
-                wait_until="domcontentloaded",
-                timeout=15000
-            )
-        return jsonify({
-            "ok": True,
-            "url": browser_page.url
-        })
+            browser_page.go_back(wait_until="domcontentloaded", timeout=15000)
+        return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/forward")
 def forward():
     try:
         browser_page = get_browser()
         with browser_lock:
-            browser_page.go_forward(
-                wait_until="domcontentloaded",
-                timeout=15000
-            )
-        return jsonify({
-            "ok": True,
-            "url": browser_page.url
-        })
+            browser_page.go_forward(wait_until="domcontentloaded", timeout=15000)
+        return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/refresh")
 def refresh():
     try:
         browser_page = get_browser()
         with browser_lock:
-            browser_page.reload(
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-        return jsonify({
-            "ok": True,
-            "url": browser_page.url
-        })
+            browser_page.reload(wait_until="domcontentloaded", timeout=30000)
+        return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/key")
 def key():
     data = request.get_json(silent=True)
     if not data or "key" not in data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing key"
-        }), 400
+        return jsonify({"ok": False, "error": "Missing key"}), 400
 
     key_value = str(data["key"])
-
     try:
         browser_page = get_browser()
         with browser_lock:
             browser_page.keyboard.press(key_value)
-        return jsonify({
-            "ok": True,
-            "key": key_value
-        })
+        return jsonify({"ok": True, "key": key_value})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/type")
 def type_text():
     data = request.get_json(silent=True)
     if not data or "text" not in data:
-        return jsonify({
-            "ok": False,
-            "error": "Missing text"
-        }), 400
+        return jsonify({"ok": False, "error": "Missing text"}), 400
 
     text = str(data["text"])
-
     try:
         browser_page = get_browser()
         with browser_lock:
             browser_page.keyboard.type(text)
-        return jsonify({
-            "ok": True
-        })
+        return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-
-    print("================================")
-    print(" ESP32 REMOTE BROWSER")
-    print("================================")
-    print(f"Screen: {WIDTH}x{HEIGHT}")
-    print(f"Port: {port}")
-    print("================================")
-
-    # threaded=False is required because Playwright sync API is tied to a single thread
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=False
-    )
+    app.run(host="0.0.0.0", port=port, threaded=False)
