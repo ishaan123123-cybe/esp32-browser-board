@@ -10,11 +10,30 @@ app = Flask(__name__)
 WIDTH = 320
 HEIGHT = 240
 
-browser_lock = threading.Lock()
+# Target capture rate. The capture thread runs independently of how many
+# clients are watching /stream, so this is the ONE place that controls
+# how often Playwright actually takes a screenshot.
+CAPTURE_FPS = 20
+CAPTURE_INTERVAL = 1.0 / CAPTURE_FPS
+
+# Lock that guards actual interaction with the Playwright page object
+# (screenshot, click, type, navigate, etc). Playwright's sync API is not
+# thread-safe, so every touch of `page` must go through this.
+browser_lock = threading.RLock()
+
+# Separate, cheap lock just for the shared frame buffer. Keeping this
+# lock distinct from browser_lock means a client reading the latest
+# frame never has to wait on a screenshot() call in progress.
+frame_lock = threading.Lock()
+frame_condition = threading.Condition(frame_lock)
+latest_frame = None
+frame_seq = 0  # increments every time a new frame is captured
 
 playwright = None
 browser = None
 page = None
+capture_thread_started = False
+
 
 def start_browser():
     global playwright, browser, page
@@ -33,30 +52,71 @@ def start_browser():
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--disable-software-rasterizer"
-        ]
+            "--disable-software-rasterizer",
+        ],
     )
 
     page = browser.new_page(
-        viewport={
-            "width": WIDTH,
-            "height": HEIGHT
-        },
-        device_scale_factor=1
+        viewport={"width": WIDTH, "height": HEIGHT},
+        device_scale_factor=1,
     )
 
-    page.goto(
-        "https://example.com",
-        wait_until="domcontentloaded",
-        timeout=30000
-    )
+    page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
 
     print("Chromium ready")
+
 
 def get_browser():
     with browser_lock:
         start_browser()
     return page
+
+
+def capture_loop():
+    """Runs forever in the background, taking screenshots at a fixed rate
+    and publishing them into the shared buffer. /screen and /stream just
+    read this buffer -- they never trigger a screenshot themselves, so
+    N connected clients cost the same as 1."""
+    global latest_frame, frame_seq
+
+    get_browser()  # ensure browser is up before the loop starts
+
+    while True:
+        loop_start = time.monotonic()
+        try:
+            with browser_lock:
+                image = page.screenshot(type="jpeg", quality=35, full_page=False)
+
+            with frame_condition:
+                latest_frame = image
+                frame_seq += 1
+                frame_condition.notify_all()
+        except Exception as e:
+            print(f"Capture error: {e}")
+
+        elapsed = time.monotonic() - loop_start
+        remaining = CAPTURE_INTERVAL - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+def ensure_capture_thread():
+    global capture_thread_started
+    with browser_lock:
+        if not capture_thread_started:
+            get_browser()
+            t = threading.Thread(target=capture_loop, daemon=True)
+            t.start()
+            capture_thread_started = True
+
+
+def wait_for_frame(timeout=2.0):
+    """Block until a frame is available, then return it."""
+    with frame_condition:
+        if latest_frame is None:
+            frame_condition.wait(timeout=timeout)
+        return latest_frame
+
 
 @app.get("/")
 def home():
@@ -71,74 +131,82 @@ def home():
     </body>
     </html>"""
 
+
 @app.get("/status")
 def status():
     try:
+        ensure_capture_thread()
         browser_page = get_browser()
         return jsonify({
             "ok": True,
             "url": browser_page.url,
             "width": WIDTH,
-            "height": HEIGHT
+            "height": HEIGHT,
         })
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.get("/screen")
 def screen():
     try:
-        browser_page = get_browser()
-        with browser_lock:
-            image = browser_page.screenshot(
-                type="jpeg",
-                quality=35,
-                full_page=False
-            )
+        ensure_capture_thread()
+        image = wait_for_frame()
+        if image is None:
+            return jsonify({"ok": False, "error": "No frame available yet"}), 503
         return send_file(
             io.BytesIO(image),
             mimetype="image/jpeg",
             download_name="screen.jpg",
-            max_age=0
+            max_age=0,
         )
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.get("/stream-stream")
 @app.get("/stream")
 def stream_screen():
+    ensure_capture_thread()
+
     @stream_with_context
     def generate():
+        last_seq = -1
         while True:
             try:
-                browser_page = get_browser()
-                with browser_lock:
-                    image = browser_page.screenshot(
-                        type="jpeg",
-                        quality=35,
-                        full_page=False
+                with frame_condition:
+                    # Wait until a NEW frame lands (push-based, not polled).
+                    # This means the stream is only ever as fast as the
+                    # capture loop, and never does redundant work.
+                    frame_condition.wait_for(
+                        lambda: frame_seq != last_seq, timeout=2.0
                     )
-                
-                # Send multipart frame boundary chunk pattern for continuous connection
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n" +
-                       f"Content-Length: {len(image)}\r\n\r\n".encode() +
-                       image + b"\r\n")
+                    image = latest_frame
+                    last_seq_local = frame_seq
+
+                if image is None:
+                    continue
+
+                last_seq = last_seq_local
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(image)}\r\n\r\n".encode()
+                    + image
+                    + b"\r\n"
+                )
+            except GeneratorExit:
+                break
             except Exception as e:
                 print(f"Stream error: {e}")
                 break
-            time.sleep(0.05)
 
     return Response(
         generate(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
-        headers={"Connection": "keep-alive", "X-Accel-Buffering": "no"}
+        headers={"Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
 
 @app.post("/navigate")
 def navigate():
@@ -161,6 +229,7 @@ def navigate():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/touch")
 def touch():
     data = request.get_json(silent=True)
@@ -181,6 +250,7 @@ def touch():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/scroll")
 def scroll():
     data = request.get_json(silent=True)
@@ -197,6 +267,7 @@ def scroll():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/back")
 def back():
     try:
@@ -206,6 +277,7 @@ def back():
         return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.post("/forward")
 def forward():
@@ -217,6 +289,7 @@ def forward():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/refresh")
 def refresh():
     try:
@@ -226,6 +299,7 @@ def refresh():
         return jsonify({"ok": True, "url": browser_page.url})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.post("/key")
 def key():
@@ -242,6 +316,7 @@ def key():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 @app.post("/type")
 def type_text():
     data = request.get_json(silent=True)
@@ -257,6 +332,9 @@ def type_text():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=False)
+    # threaded=True is required now -- without it, one connected /stream
+    # client still blocks every other request from being handled at all.
+    app.run(host="0.0.0.0", port=port, threaded=True)
